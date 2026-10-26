@@ -1,0 +1,611 @@
+
+A Railway Patrolman is a railway employee responsible for inspecting railway tracks and ensuring the safety of railway operations. The patrolman regularly walks along assigned railway sections to identify damaged tracks, broken rails, loose fittings, obstructions, or other potential hazards. They also help monitor railway bridges, level crossings, and surrounding areas, especially during adverse weather conditions. If they notice any danger, they immediately inform the concerned railway authorities and take necessary precautions to prevent accidents. A railway patrolman plays an important role in maintaining track safety, protecting passengers, and ensuring the smooth and safe movement of trains.
+
+
+================================================================================
+ PATROLMAN REPORT – PRD / LOGIC DOCUMENT
+ Module : user-service-server / modules/report
+ Entry  : utils/PatrolmanReportUtil.java  -> processPatrolmanDevice(...)
+ Written: 2026-10-17 (reflects code on branch main @ 43ce866)
+================================================================================
+
+CONTENTS
+  1. Purpose
+  2. Where it is called from
+  3. Classes involved
+  4. Inputs
+  5. Data sources (MongoDB)
+  6. Key concepts & units
+  7. End-to-end flow (processPatrolmanDevice)
+  8. Trip segmentation (splitting a day's track into trips)
+  9. Per-trip evaluation (createSingleTripReport + getDeviceRemark)
+ 10. Matching segments to scheduled trips (finalizePatrolmanTrip)
+ 11. Overspeed detection (DeviceSpeedUtil)
+ 12. Device-level summary (TripSummary.patrolmanTripSummary)
+ 13. Output (DivisionTripReportDTO / TripReportStatusDto)
+ 14. Remarks dictionary
+ 15. Constants / thresholds
+ 16. Known issues, risks and dead code
+ 17. Commented-out variants (PatrolmanReportUtilNew / PatrolmanReportUtilClaude)
+
+
+--------------------------------------------------------------------------------
+1. PURPOSE
+--------------------------------------------------------------------------------
+For one GPS device (a patrolman / keyman-style railway track walker) and one
+report date, decide:
+
+  * How many of the device's scheduled "beats" (trips) were actually walked.
+  * For each trip: actual start/end KM on the track, actual start/end time,
+    distance covered, max speed, battery at start/end, and a remark
+    ("All work done successfully." / "Trip not completed." / ...).
+  * For the device as a whole: allocated trips vs actual trips, total walking
+    distance, max speed, overspeed remark, and a final summary remark.
+
+The result (DivisionTripReportDTO) is one row of the division-level
+"exception report" and is also what gets saved to division_report_log and
+emailed by the report-email scheduler.
+
+A "beat" is a stretch of railway track defined by a start KM and end KM
+(chainage), plus a time window in which it must be walked. A device may have
+several beats per day (e.g. walk KM 100 -> 105, then back 105 -> 100).
+
+
+--------------------------------------------------------------------------------
+2. WHERE IT IS CALLED FROM
+--------------------------------------------------------------------------------
+services/impl/ExceptionReportServiceImpl.java (9 call sites):
+  - getExceptionReport                     (division report, on demand)
+  - getExceptionSingleDeviceReport         (one device)
+  - getRegeneratedReport                   (re-generate & re-save)
+  - getEmailRegenerationReport             (used by email flow)
+  - getRegenerateExceptionSingleDeviceReport
+  - getDivisionSummaryReport               (isSummary = true)
+
+Dispatch rule (getExceptionReport):
+  1. If a saved report already exists in division_report_log for
+     (division, deviceType, date) -> return it (trip list stripped when
+     isSummary).
+  2. If the division has reporting disabled -> return empty list.
+  3. deviceType 20 is mapped to 1 for the device lookup.
+  4. Load all IMEIs of the division for that device type/date
+     (DeviceInfoUtils.getImeisByDivisionWithRole).
+  5. Process devices in parallel on an 8-thread pool.
+       deviceType 1, 7, 8, 9  -> PatrolmanReportUtil
+       13, 14                 -> PushTrolleyReportUtil
+       3, 12                  -> USFDReportUtil
+       5, 6                   -> SwmReportUtil
+       anything else          -> PatrolmanReportUtil (fallback)
+  6. Any exception for an IMEI is printed to stderr and that device is
+     silently dropped from the report (returns null).
+
+
+--------------------------------------------------------------------------------
+3. CLASSES INVOLVED
+--------------------------------------------------------------------------------
+PatrolmanReportUtil   Orchestrator. Guards, segmentation choice, per-trip
+                      evaluation, matching segments to schedule.
+DeviceBeatUtils       Reads the device's approved & active beats from
+                      trip_data and builds DeviceTrip objects.
+ReportMapUtil         Geometry helpers: haversine, RDPS km parsing,
+                      "valid walking distance", battery parsing.
+LatLngTrip            Splits a track into trips using compass direction
+                      (no RDPS needed).
+RDPSTrip              Splits a track into trips using RDPS km values; also
+                      a dedicated single-trip evaluator.
+DeviceSpeedUtil       Overspeed detection and remark text.
+TripSummary           Rolls per-trip results up into the device-level
+                      DivisionTripReportDTO (merging, re-checking by
+                      distance, final remark).
+DefaultTripUtil       Builds placeholder trips in TripSummary.
+DateUtils             Midnight / mid-day epoch helpers (Asia/Kolkata).
+
+Injected but unused in PatrolmanReportUtil: DeviceStoppageUtil.
+
+
+--------------------------------------------------------------------------------
+4. INPUTS  (processPatrolmanDevice)
+--------------------------------------------------------------------------------
+divisionId        Division id                         (not used inside)
+startDate         Report date (epoch, any time that day)
+deviceImei        Device IMEI
+deviceNo          Device number (appended to name: "<name>-<no>")
+deviceName        Device display name
+deviceType        1 patrolman, 7, 8, 9 (8/9 get special handling),
+                  20 = night patrol (special history window), 6 exempt
+                  from the off-track check
+sectionName       Railway section label
+shiftType         Passed straight through to output
+distMargin        Allowed KM error in METRES for start/end matching
+                  (per device: reportDistMargin)
+timeMargin        Extra time after the beat end time to still read
+                  history (per device: reportTimeMargin)
+locationSource    RDPS  -> use RDPS km values from history
+                  LATLNG-> use raw lat/lng direction
+tripWiseReport    (not used inside)
+isSummary         true -> output trip list is emptied
+path              Comma-separated division ids; turned into division names
+                  for the output "path" field
+
+
+--------------------------------------------------------------------------------
+5. DATA SOURCES (MongoDB)
+--------------------------------------------------------------------------------
+trip_data  (TripEntity)       via TripDataRepository.findAllApprovedActiveTrips
+    tripNo, startTime/endTime (offset from midnight), tripStartKm, tripEndKm,
+    breakStartTime/breakEndTime, sectionName.
+location   (device history)   via DeviceHistoryRepository.findLightHistoryForTrip
+    timestamp, geoLocation.coordinates [lon, lat], speed, voltageLevel,
+    nearestRdps { kilometer, distance, distance_diff }, blind.
+devices                       via DeviceRepository.findReportDistMarginByImei
+    reportDistMargin (metres).
+
+
+--------------------------------------------------------------------------------
+6. KEY CONCEPTS & UNITS
+--------------------------------------------------------------------------------
+RDPS / nearestRdps
+    Each history point is pre-matched to the nearest railway KM post.
+      kilometer     = KM post number
+      distance      = metres past that post
+      distance_diff = perpendicular distance (m) of the GPS point from track
+    "Actual km" = kilometer + distance/1000, rounded to 2 decimals
+    (ReportMapUtil.actualDoubleKm). Null RDPS -> 0.0.
+
+On-track point
+    distance_diff < N metres (ReportMapUtil.distanceMargin). N is 100 for the
+    off-track guard, 500 (VALID_RADIUS) for per-trip distance, 100 or 300 in
+    the summary.
+
+Valid walking distance
+    Sum of haversine distances between consecutive points where BOTH points
+    are on-track. Any single hop > 10 km is treated as a GPS jump and counts
+    as 0.
+
+Time
+    Beat times are offsets from midnight; absolute time =
+    dateToMidNightEpoch(startDate) + offset. Timestamps are handled as epoch
+    SECONDS in this flow (DeviceSpeedUtil multiplies by 1000 before display;
+    toMidDayEpoch returns seconds). Time zone is Asia/Kolkata.
+
+Direction of a beat
+    Increasing beat: startKm < endKm. Decreasing beat: startKm > endKm.
+    Expected distance = |endKm - startKm|.
+
+Vary trip
+    DeviceBeatUtils sets isVaryTrip = true when, for some i,
+    trip[i].startKm != trip[i+1].endKm (tolerance 0.001). i.e. the beats are
+    NOT a simple "go and come back" over the same stretch.
+    avgDistance = sum(|start-end|) of all beats except the last / number of
+    beats.
+
+
+--------------------------------------------------------------------------------
+7. END-TO-END FLOW  (processPatrolmanDevice)
+--------------------------------------------------------------------------------
+Step 1  Load schedule
+        trip  = extractTripTime(imei)  -> combined window: first beat's start
+                time, last beat's end time, first beat's km, break times,
+                isVaryTrip, avgDistance.
+        trips = extractTripList(imei)  -> each beat individually.
+
+Step 2  Guard: no beats
+        trip.startTimeStamp == -1  ->  summary with remark
+        "Trip not schedule for this device."
+
+Step 3  Compute windows
+        tripStartTime = midnight + firstBeat.start
+        tripEndTime   = midnight + lastBeat.end
+        History window:
+          deviceType 20 (night): 12:00 of start-day  ->  16:00 of end-day
+                                 + timeMargin
+          others:                tripStartTime -> tripEndTime + timeMargin
+
+Step 4  Load history in that window, sorted by timestamp ASC.
+
+Step 5  Guard: no history
+        Every beat gets a default trip "Device was Off."
+        -> workOnOffTripSummary (actualTrips = 0, distance 0, remark
+           "Device was Off.").
+
+Step 6  Guard: off track
+        valid = points with distance_diff < 100 m.
+        If valid count <= 10 and deviceType != 6:
+          every beat gets a default trip "Off Track."
+          -> workOnOffTripSummary with remark "Working on off track."
+
+Step 7  Guard: nothing before beat end
+        trimmedHistory = points with timestamp < tripEndTime.
+        If empty: every beat -> "No Location Found within trip time."
+        -> patrolmanTripSummary with remark
+           "Device location not found during with Trips."
+
+Step 8  actualStartTime = first history point time
+        actualEndTime   = last point before tripEndTime
+
+Step 9  Choose segmentation (see section 8)
+        1 beat + RDPS   -> RDPSTrip.singleTripSegment evaluates the whole
+                           history as one trip and returns IMMEDIATELY via
+                           TripSummary.singleTripSummary (sections 9-12 are
+                           skipped).
+        1 beat + LATLNG -> LatLngTrip.latLonTripSegment
+        N beats + LATLNG-> LatLngTrip.latLonTripSegment
+        N beats + RDPS  -> RDPSTrip.tripSegment
+
+Step 10 finalizePatrolmanTrip (section 10) -> per-trip TripReportStatusDto
+        list.
+
+Step 11 TripSummary.patrolmanTripSummary (section 12) -> final DTO.
+        If the trip list is still empty, remark
+        "Trip not schedule for this device.Please send beat to Admin."
+
+
+--------------------------------------------------------------------------------
+8. TRIP SEGMENTATION
+--------------------------------------------------------------------------------
+8.1 LatLngTrip.latLonTripSegment  (direction based)
+    - For each consecutive pair of points compute the compass quadrant
+      (NE / NW / SE / SW). Pairs with zero lat or lon change are ignored.
+    - Keep a rolling list of quadrants. Once it has > 10 entries, count
+      transitions into "belts": NORTH, SOUTH, EAST, WEST (diagonal repeats
+      count towards two belts each).
+    - The belt with the highest count is the dominant direction; its
+      opposite is the reverse belt.
+    - If the reverse belt count > REVERSE_TRIP_COUNT (4), a U-turn is
+      assumed: cut a segment from the last cut to (currentIndex - 10),
+      start a new segment there, keep only the last 10 directions.
+    - After the loop the remainder is added as the last segment.
+    Result: list of segments, ideally one per walked direction.
+
+8.2 RDPSTrip.tripSegment  (RDPS km based – current implementation)
+    - Walks points with non-null RDPS.
+    - When the km DECREASES compared with the previous point, a "round"
+      starts at that point.
+    - After LOCATIONS_PER_ROUND (10) more RDPS points, the round
+      [roundStart .. current] is saved and the search restarts for the
+      next decrease.
+    Result: a list of ~10-point windows, each starting at a km decrease.
+    (A fuller 100 m-confirmed direction-change algorithm is present but
+    commented out in the same file.)  See section 16 – this is a likely
+    source of wrong results.
+
+8.3 RDPSTrip.singleTripSegment  (single beat, RDPS)
+    - Finds startIndex = point whose km is closest to beat startKm and
+      endIndex = closest to beat endKm (with extra early-match rules for
+      increasing beats and within distMargin).
+    - Distance covered = haversine sum over (endIndex - startIndex) hops.
+    - totalDiff = |startKm - km(startIndex)| + |endKm - km(endIndex)|
+      (end diff is 0 when the walker overshot the end).
+    - totalDiff > distMargin/1000 + 0.08 km  -> "Trip not completed."
+      otherwise                               -> "All work done
+                                                 successfully." and
+                                                 distance = expected.
+    - No start/end match at all -> "Trip not completed.", actual km/time
+      = first/last point.
+    - Overspeed remark appended when maxSpeed > 8.
+    - TripSummary.singleTripSummary: actualTrips = 1 if remark contains
+      "all work done successfully.", else 0.
+
+
+--------------------------------------------------------------------------------
+9. PER-TRIP EVALUATION
+   PatrolmanReportUtil.createSingleTripReport(segment, beat, ...)
+--------------------------------------------------------------------------------
+Input: one segment (list of points) + the beat it is assigned to.
+
+a) Empty segment -> remark only (passed-in remark).
+
+b) Basics
+     startBattery / endBattery = voltageLevel of first / last point
+     actualStartTime / actualEndTime = first / last point time
+     coverTrip = valid walking distance with radius 500 m
+     expectedDistanceToCover = |endKm - startKm|
+
+c) Segment start/end km (currentStartKm / currentEndKm)
+     Normally km of first and last point.
+     If first point has no RDPS: walk forward to the first point with RDPS,
+     summing metres walked, and use (thatKm - metresWalked/1000).
+     If last point has no RDPS: walk backward similarly and use
+     (thatKm + metresWalked/1000).
+
+d) Best start / end match inside the segment
+     For each consecutive pair with RDPS:
+       - skip if km jumps > 2.0 km between points (JUMP_THRESHOLD)
+       - keep the index whose km is closest to beat startKm (within 10 km)
+       - keep the index whose km is closest to beat endKm   (within 10 km)
+     Pairs without RDPS add their haversine distance to coverMeters, which
+     is added on top of coverTrip.
+     actualStartKm / actualEndKm = km at those indexes, else the segment
+     start/end km from (c).
+
+e) Remark = getDeviceRemark(...)  (rules below)
+     distanceTobeLeftAsMarginError = expected - reportDistMargin/1000
+     minimumEnd = endKm - distMargin/1000
+
+   Case A: walked in increasing km order (actualStart < actualEnd)
+     A1 beat is decreasing (startKm > endKm) – SUCCESS if any of:
+        floor(aStart)==endKm  && floor(aEnd)==startKm
+        floor(aStart)==endKm  && aEnd > startKm
+        floor(aStart)==endKm  && round(aEnd)==startKm
+        floor(aStart)==floor(startKm) && floor(aEnd)==floor(endKm)
+        startKm <= round(aStart) && round(aEnd) >= minimumEnd
+        coverTrip >= distanceTobeLeft AND
+           aEnd within 0.25 km of (startKm - 0.45 km)
+     A2 beat is increasing – SUCCESS if any of:
+        round(aStart)==floor(startKm) && round(aEnd)==floor(endKm)
+        round(aStart) <= startKm && round(aEnd) >= minimumEnd
+        coverTrip >= distanceTobeLeft
+     otherwise "Trip not completed."
+
+   Case B: walked in decreasing km order (actualStart >= actualEnd)
+     B1 beat is decreasing – SUCCESS if any of:
+        startKm-0.45 < aStart < startKm && aEnd < endKm
+        floor/round(aStart) >= floor(startKm) && floor/round(aEnd) <=
+           floor(endKm)
+        round(aStart)==round(startKm) && round(aEnd)==round(endKm)
+        coverTrip >= distanceTobeLeft AND aStart <= startKm+distMargin AND
+           aEnd ~ endKm (floor/round equal, or within 1.0 km)
+     B2 beat is increasing (walked backwards) – SUCCESS if any of:
+        floor(aStart)==endKm && round(aEnd)==startKm
+        round(aStart)==floor(endKm) && round(aEnd)==floor(startKm)
+        round(aStart) >= round(endKm) && round(aEnd) <= round(startKm)
+        coverTrip >= distanceTobeLeft AND aStart > endKm - distMargin
+     otherwise "Trip not completed."
+
+   Note: direction of walk vs beat direction is effectively ignored – a
+   beat walked in reverse is still accepted.
+
+f) Speed: DeviceSpeedUtil.getMaxSpeed over the beat window (minus break).
+   If maxSpeed > 8 the overspeed text is appended to the remark.
+   avgSpeed = maxSpeed / 2 (not a real average).
+
+g) Output TripReportStatusDto (see section 13).
+
+
+--------------------------------------------------------------------------------
+10. MATCHING SEGMENTS TO THE SCHEDULE
+    PatrolmanReportUtil.finalizePatrolmanTrip
+--------------------------------------------------------------------------------
+- Read reportDistMargin for the device (metres) -> reportDistanceTobeLeft km.
+- For each segment in order, evaluate it against beat[count] and advance
+  count, but never past the last beat. (So if there are MORE segments than
+  beats, all extra segments are evaluated against the last beat.)
+- remainingTrip = beats - evaluated segments.
+
+- If isVaryTrip AND segments < beats:
+    maxSegment = longest segment.
+    If "maxKm" (see 16) > avgDistance: try to carve the remaining beats out
+    of maxSegment by finding indexes whose km is within -50 m / +100 m of
+    the beat start / end, and evaluate that sub-list. Beats that still have
+    no result are filled with "Trip not completed." defaults.
+    Else: fill remaining beats with "Trip not completed." defaults.
+- Otherwise: fill remaining beats with "Trip not completed." defaults.
+
+Default trip (createDefaultTrip): actual km = -1, actual times = -1,
+battery = -1, speed 0, distance 0, remark as given.
+
+
+--------------------------------------------------------------------------------
+11. OVERSPEED DETECTION  (DeviceSpeedUtil.getMaxSpeed – 8-arg version)
+--------------------------------------------------------------------------------
+- Drop points inside the break window [breakStart, breakEnd).
+- Keep points within [beatStart + 15 min, beatEnd - 15 min].
+- Need >= 2 points, else speed 0.
+- Ignore pairs where lat & lon are identical (stationary).
+- Find the longest run of consecutive points with speed >= 8 (measured by
+  duration).
+- If that run is longer than 8 points: maxSpeed = max speed in the run and
+  remark = "Overspeed from HH:mm to HH:mm for X min Y sec" (IST).
+  Otherwise maxSpeed = 3 (default, meaning "no overspeed").
+- Callers treat maxSpeed > 8 as overspeed.
+
+
+--------------------------------------------------------------------------------
+12. DEVICE-LEVEL SUMMARY  (TripSummary.patrolmanTripSummary)
+--------------------------------------------------------------------------------
+Inputs: per-trip list, beats, history, remark from guards.
+
+12.1 Common
+   expectedTripDistance = sum |end - start| over all beats.
+   tripStartKm / tripEndKm = first beat's km.
+   maxSpeed = max over trip list.
+   overSpeedRemark = text after the first "." of the first trip remark that
+   mentions overspeed.
+
+12.2 Single beat (beats == 1)
+   - If any trip says success:
+       type 8/9 -> keep all successful trips
+       others   -> keep the successful trip with largest distance
+       actualTrips = 1, remark success (+ overspeed).
+   - Else if there are more trip results than beats: find the pair of trips
+     whose end/start km are closest (<= 0.5 km), merge them into one
+     successful trip (min..max km, summed distance).
+     Then pick the successful trip with largest distance, or, if none, the
+     trip with largest distance with "Trip not completed.".
+
+12.3 Multiple beats
+   - If not every beat succeeded and there are more results than beats:
+     walk the NON-successful results pairwise and merge two neighbours into
+     one successful trip when their km meet within 0.5 km
+     (end1~start2, start1~end2, start1~beatStart & end2~beatEnd, both ends
+     ~beat ends, end1~end2).
+   - If successful results >= beats: keep the first N successful ones,
+     remark success, actualTrips = beats.
+   - Else (types 8/9 and others have separate but similar blocks):
+     try a second pairwise merge with tolerance 0.6 km on any combination
+     of start/end; re-number merged trips 1..N and stamp beat km/time on
+     them; pad missing beats with "No location found for this trip".
+     remark success if successful >= beats else "Trip not completed.",
+     actualTrips = number of successful trips.
+
+12.4 Guard remarks ("Device was Off.", "Off Track.", etc.)
+   divisionTrip = the first such trip; actualTrips = 0; remark = guard
+   remark.
+
+12.5 Walking-distance re-check (overrides 12.2/12.3)
+   walking = LATLNG ? total haversine distance
+                    : valid walking distance (radius 100 m)
+   If valid points > 10 and not all beats succeeded:
+     types 8/9: walking at radius 100 m (no override here).
+     others   : walking at radius 300 m, then
+       - walking > expected and >1 beat and >1 success -> if >70 % of RDPS
+         points (30 % for vary trips) lie within [beatMin-1km, beatMax+1km]
+         => SUCCESS for all beats, else "Trip not completed.".
+       - walking > expected - distMargin => same range check, SUCCESS if ok.
+       - remark is success but fewer successes than beats and
+         walking < 65 % of expected => "Trip not completed.".
+       - walking >= expected => range check, SUCCESS if ok.
+   Final checks (when history exists):
+     - walking < expected by more than 10 %  => "Trip not completed.",
+       actualTrips = 0.
+     - remark success => walking reported as expected distance.
+     - type 8 (and type 9 when not all beats done): walking >= expected =>
+       success; walking < 80 % => "Trip not completed.".
+     - distanceCoverTrip = expected if walking >= expected (not 8/9), else
+       walking.
+
+12.6 Output path = division names resolved from "path" ids (order kept).
+     tripList = [] when isSummary, otherwise the ORIGINAL per-trip list
+     (not the merged list).
+
+
+--------------------------------------------------------------------------------
+13. OUTPUT
+--------------------------------------------------------------------------------
+DivisionTripReportDTO (one per device)
+  deviceImei, deviceName ("<name>-<no>"), deviceNo, sectionName, shiftType
+  tripStartTime / tripEndTime        scheduled window (first start, last end)
+  actualStartTime / actualEndTime    first point / last point before end
+  tripStartKm / tripEndKm            first beat
+  tripActualStartKm / tripActualEndKm
+  tripDistanceTobeCoverKm            sum of beat lengths
+  distanceCoverTrip                  credited distance
+  walkingDistance                    measured walking distance
+  tripMaxSpeed
+  allocatedTrips / actualTrips
+  remark, path, isBlind (always false here)
+  tripList                           List<TripReportStatusDto>
+
+TripReportStatusDto (one per trip)
+  tripNo, deviceImei, deviceTypeId
+  tripStartTime / tripEndTime              scheduled
+  tripActualStartTime / tripActualEndTime  first/last point of segment
+  tripStartKm / tripEndKm                  scheduled
+  tripActualStartKm / tripActualEndKm      segment start/end km (see 16)
+  tripDistanceTobeCoverKm, distanceCoverTrip
+  tripMaxSpeed, tripAvgSpeed
+  deviceTripStartBatteryStatus / deviceTripEndBatteryStatus
+  remark, (walkingDistance for single RDPS trip)
+
+
+--------------------------------------------------------------------------------
+14. REMARKS DICTIONARY
+--------------------------------------------------------------------------------
+"All work done successfully."                 beat completed
+"Trip not completed."                         beat not completed
+"Overspeed from HH:mm to HH:mm for X min Y sec" appended on overspeed
+"Trip not schedule for this device."          no approved active beats
+"Trip not schedule for this device.Please send beat to Admin."
+                                              beats exist but no trips built
+"Device was Off." / summary same              no history in window
+"Off Track." / summary "Working on off track." <= 10 on-track points
+"No Location Found within trip time." /
+  summary "Device location not found during with Trips."
+                                              no points before beat end
+"No location found for this trip"             padding added in summary
+
+
+--------------------------------------------------------------------------------
+15. CONSTANTS / THRESHOLDS
+--------------------------------------------------------------------------------
+PatrolmanReportUtil
+  VALID_RADIUS                 500 m   on-track radius for per-trip distance
+  MIN_DISTANCE_VARY_M_MARGIN    50 m   vary-trip start/end lower margin
+  MAX_DISTANCE_VARY_M_MARGIN   100 m   vary-trip start/end upper margin
+  BUFFER_BEAT_M                400 m   extended start window (+50 m)
+  MAX_DISTANCE_ABS_TOLERANCE   1.0 km  end match tolerance
+  JUMP_THRESHOLD               2.0 km  ignore km jumps between points
+  MAX_REASONABLE_DIFF         10.0 km  ignore matches further than this
+  off-track guard              100 m distance_diff, > 10 points needed
+  MIN_DISTANCE_M_MARGIN, HISTORY_END_TIME_MARGIN_S, REVERSE_TRIP_COUNT
+                               declared, unused
+LatLngTrip    REVERSE_TRIP_COUNT 4, window 10 directions
+RDPSTrip      LOCATIONS_PER_ROUND 10; single-trip margin distMargin + 80 m
+DeviceSpeedUtil  overspeed >= 8 for > 8 points, 15 min margin at both
+                 ends of beat, break window excluded
+TripSummary   merge tolerance 0.5 km (KM_TOLERANCE) and 0.6 km (TOLERANCE),
+              range check 70 % (30 % vary), completion 65 % / 80 % / 10 %
+ReportMapUtil haversine hop > 10 km treated as 0
+
+
+--------------------------------------------------------------------------------
+16. KNOWN ISSUES, RISKS AND DEAD CODE
+--------------------------------------------------------------------------------
+(Found while reading; not fixed. Line numbers are PatrolmanReportUtil.java
+ unless stated.)
+
+Correctness
+ 1. Off-track guard (L105-108) builds default trips with the FIRST beat's
+    km for every beat and with raw offsets trip.getStartTimeStamp() /
+    getEndTimeStamp() instead of midnight + offset. Other guards use
+    trips.get(i) and absolute times.
+ 2. createSingleTripReport computes actualStartkm / actualEndKm (best
+    match) for the remark, but the DTO stores currentStartKm /
+    currentEndKm (segment first/last point) as tripActualStartKm/EndKm
+    (L628). The km shown in the report is not the km the remark was
+    decided on.
+ 3. Vary-trip check (L283): maxKm sums the km POST VALUES of every point
+    in the longest segment, not distance walked, so it is almost always
+    > avgDistance.
+ 4. RDPSTrip.tripSegment produces ~10-point windows starting at every km
+    decrease, not full trips; points before the first decrease and after
+    the last window are dropped. With GPS noise this yields many tiny
+    segments, all extra ones evaluated against the last beat.
+ 5. More segments than beats: count is capped (L271) so every extra
+    segment is labelled with the last beat's number/km.
+ 6. RDPSTrip.singleTripSegment (L562-579) sums distance over
+    histories.get(j) instead of tripHistory.get(j) – distance is measured
+    from the start of the day, not from the matched start point. Its
+    no-RDPS fallback puts latitude/longitude into actualStart/actualEnd km.
+ 7. LatLngTrip last segment uses subList(start, size-1) – drops the final
+    point.
+ 8. "data_not_found" checks use == on String (L474, L500) – reference
+    comparison, effectively never true. If nearestRdps is ever the string
+    "data_not_found", actualDoubleKm casts it to Map -> ClassCastException
+    and the whole device is dropped from the report (see section 2, step 6).
+ 9. findReportDistMarginByImei may return null -> NPE at L183.
+10. TripSummary: `deviceType == 8 || deviceType == 9 && actualTrip <
+    trips.size()` – operator precedence makes the extra condition apply
+    only to type 9.
+11. TripSummary padding trips use DateUtils.toMidNightEpoch() (TODAY)
+    instead of the report date – wrong times when regenerating past days.
+12. TripSummary multi-beat merge loops index tripList.get(i+1) while
+    iterating remainingTrips – can go out of bounds or merge wrong trips.
+13. avgSpeed = maxSpeed / 2 – not an actual average.
+14. getDeviceRemark accepts a beat walked in either direction; several
+    branches use floor/round on km which makes a 0.5-0.99 km error pass.
+15. DeviceBeatUtils.avgDistance excludes the last beat from the sum but
+    divides by all beats.
+16. Exceptions per IMEI are swallowed (System.err) – device just
+    disappears from the division report.
+
+Dead / unused
+  - finalizeVaryTrip(), digitCount(), the large commented isVaryTrip block
+    in finalizePatrolmanTrip.
+  - Params divisionId, tripWiseReport; field deviceStoppageUtil.
+  - Speed branch for deviceType 8/9 (L606-612) – both branches identical.
+  - Constants MIN_DISTANCE_M_MARGIN, HISTORY_END_TIME_MARGIN_S,
+    REVERSE_TRIP_COUNT.
+  - RDPSTrip.tripReport() / checkForTrip() – not called from this flow.
+
+
+--------------------------------------------------------------------------------
+17. COMMENTED-OUT VARIANTS
+--------------------------------------------------------------------------------
+utils/PatrolmanReportUtilNew.java and utils/PatrolmanReportUtilClaude.java
+are entirely commented out (class declaration is commented) and are not
+referenced anywhere. Only PatrolmanReportUtil is live.
+
+================================================================================
+END
+================================================================================
